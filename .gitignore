@@ -1,0 +1,28 @@
+# Data & vectorstore (regenerable)
+data/
+vectorstore/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+sensitive.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
