@@ -9,6 +9,9 @@ venv/
 env/
 sensitive.py
 
+#logs
+*.log
+
 # Python
 __pycache__/
 *.pyc
