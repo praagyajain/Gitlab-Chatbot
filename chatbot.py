@@ -10,9 +10,10 @@ import re
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferWindowMemory
-from langchain.prompts import PromptTemplate
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
 
 from config import (
     GOOGLE_API_KEY,
@@ -23,9 +24,24 @@ from config import (
     RETRIEVER_K,
 )
 
-# ── Prompt Template ───────────────────────────────────────────────────────────
+# ── Prompt Templates ──────────────────────────────────────────────────────────
 
-SYSTEM_TEMPLATE = """You are **GitLab Guide**, a knowledgeable and friendly AI assistant 
+# Condense follow-up questions into standalone questions
+CONDENSE_SYSTEM = (
+    "Given a chat history and the latest user question which might reference "
+    "context in the chat history, formulate a standalone question which can be "
+    "understood without the chat history. Do NOT answer the question, just "
+    "reformulate it if needed and otherwise return it as is."
+)
+
+CONDENSE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", CONDENSE_SYSTEM),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
+
+# QA prompt
+QA_SYSTEM = """You are **GitLab Guide**, a knowledgeable and friendly AI assistant 
 specializing in GitLab's Handbook and Product Direction.
 
 RULES:
@@ -39,16 +55,13 @@ RULES:
 5. Be professional yet approachable — like a helpful colleague.
 
 CONTEXT:
-{context}
+{context}"""
 
-QUESTION: {question}
-
-HELPFUL ANSWER:"""
-
-QA_PROMPT = PromptTemplate(
-    template=SYSTEM_TEMPLATE,
-    input_variables=["context", "question"],
-)
+QA_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", QA_SYSTEM),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
 
 
 # ── Chatbot Class ─────────────────────────────────────────────────────────────
@@ -58,7 +71,7 @@ class GitLabChatbot:
 
     def __init__(self):
         self.chain = None
-        self.memory = None
+        self.chat_history = []  # list of HumanMessage / AIMessage
         self._initialized = False
 
     def initialize(self) -> bool:
@@ -66,7 +79,6 @@ class GitLabChatbot:
         if self._initialized:
             return True
 
-        # Validate prerequisites
         api_key = GOOGLE_API_KEY
         if not api_key:
             raise ValueError(
@@ -80,7 +92,7 @@ class GitLabChatbot:
                 "Run `python scraper.py` then `python data_processor.py` first."
             )
 
-        # Load embeddings & vector store
+        # Embeddings & vector store
         embeddings = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL,
             model_kwargs={"device": "cpu"},
@@ -99,26 +111,14 @@ class GitLabChatbot:
             model=LLM_MODEL,
             google_api_key=api_key,
             temperature=LLM_TEMPERATURE,
-            convert_system_message_to_human=True,
         )
 
-        # Memory (sliding window of 5 exchanges)
-        self.memory = ConversationBufferWindowMemory(
-            k=5,
-            memory_key="chat_history",
-            return_messages=True,
-            output_key="answer",
+        # Build chain: history-aware retriever → stuff documents → answer
+        history_aware_retriever = create_history_aware_retriever(
+            llm, retriever, CONDENSE_PROMPT
         )
-
-        # Conversational retrieval chain
-        self.chain = ConversationalRetrievalChain.from_llm(
-            llm=llm,
-            retriever=retriever,
-            memory=self.memory,
-            combine_docs_chain_kwargs={"prompt": QA_PROMPT},
-            return_source_documents=True,
-            verbose=False,
-        )
+        qa_chain = create_stuff_documents_chain(llm, QA_PROMPT)
+        self.chain = create_retrieval_chain(history_aware_retriever, qa_chain)
 
         self._initialized = True
         return True
@@ -127,39 +127,38 @@ class GitLabChatbot:
         """
         Ask a question and get an answer with sources.
 
-        Args:
-            question: The user's question.
-            role_context: Optional role context string. When non-empty, it is
-                prepended to the question before passing to the chain.
-
-        Returns:
-            dict with keys:
-                "answer"     – answer text (may contain HTML markup)
-                "raw_answer" – plain-text answer with HTML tags stripped
-                "sources"    – list of {title, url}
+        Returns dict with keys: answer, raw_answer, sources
         """
         if not self._initialized:
             self.initialize()
 
-        # Prepend role context when provided (Requirement 7.3)
         effective_question = (
             f"{role_context}\n\n{question}" if role_context else question
         )
 
-        result = self.chain.invoke({"question": effective_question})
+        result = self.chain.invoke({
+            "input": effective_question,
+            "chat_history": self.chat_history,
+        })
+
+        answer = result.get("answer", "Sorry, I couldn't generate a response.")
+
+        # Update sliding window history (keep last 5 exchanges = 10 messages)
+        self.chat_history.append(HumanMessage(content=effective_question))
+        self.chat_history.append(AIMessage(content=answer))
+        if len(self.chat_history) > 10:
+            self.chat_history = self.chat_history[-10:]
 
         # De-duplicate sources
         seen = set()
         sources = []
-        for doc in result.get("source_documents", []):
+        for doc in result.get("context", []):
             url = doc.metadata.get("source", "")
             title = doc.metadata.get("title", "Unknown")
             if url and url not in seen:
                 seen.add(url)
                 sources.append({"title": title, "url": url})
 
-        answer = result.get("answer", "Sorry, I couldn't generate a response.")
-        # Strip HTML tags for raw_answer (Requirement 7.4)
         raw_answer = re.sub(r"<[^>]+>", "", answer)
 
         return {
@@ -170,5 +169,4 @@ class GitLabChatbot:
 
     def clear_memory(self):
         """Reset conversation history."""
-        if self.memory:
-            self.memory.clear()
+        self.chat_history = []
