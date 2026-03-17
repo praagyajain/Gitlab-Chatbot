@@ -10,8 +10,8 @@ import re
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -26,7 +26,6 @@ from config import (
 
 # ── Prompt Templates ──────────────────────────────────────────────────────────
 
-# Condense follow-up questions into standalone questions
 CONDENSE_SYSTEM = (
     "Given a chat history and the latest user question which might reference "
     "context in the chat history, formulate a standalone question which can be "
@@ -40,7 +39,6 @@ CONDENSE_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "{input}"),
 ])
 
-# QA prompt
 QA_SYSTEM = """You are **GitLab Guide**, a knowledgeable and friendly AI assistant 
 specializing in GitLab's Handbook and Product Direction.
 
@@ -72,7 +70,8 @@ class GitLabChatbot:
     def __init__(self):
         self.chain = None
         self._llm = None  # stored for follow-up generation
-        self.chat_history = []  # list of HumanMessage / AIMessage
+        self._retriever = None
+        self.chat_history = []
         self._initialized = False
 
     def initialize(self) -> bool:
@@ -102,35 +101,60 @@ class GitLabChatbot:
         vectorstore = FAISS.load_local(
             VECTORSTORE_DIR, embeddings, allow_dangerous_deserialization=True
         )
-        retriever = vectorstore.as_retriever(
+        self._retriever = vectorstore.as_retriever(
             search_type="similarity",
             search_kwargs={"k": RETRIEVER_K},
         )
 
         # LLM
-        llm = ChatGoogleGenerativeAI(
+        self._llm = ChatGoogleGenerativeAI(
             model=LLM_MODEL,
             google_api_key=api_key,
             temperature=LLM_TEMPERATURE,
         )
-        self._llm = llm  # store for external access (follow-up generation)
 
-        # Build chain: history-aware retriever → stuff documents → answer
-        history_aware_retriever = create_history_aware_retriever(
-            llm, retriever, CONDENSE_PROMPT
-        )
-        qa_chain = create_stuff_documents_chain(llm, QA_PROMPT)
-        self.chain = create_retrieval_chain(history_aware_retriever, qa_chain)
+        # History-aware retriever: condenses follow-up questions using chat history
+        condense_chain = CONDENSE_PROMPT | self._llm | StrOutputParser()
 
+        def history_aware_retrieve(inputs: dict) -> list:
+            chat_history = inputs.get("chat_history", [])
+            question = inputs["input"]
+            # Only condense if there's prior history
+            if chat_history:
+                standalone = condense_chain.invoke({
+                    "input": question,
+                    "chat_history": chat_history,
+                })
+            else:
+                standalone = question
+            return self._retriever.invoke(standalone)
+
+        # QA chain: formats docs into context string, then prompts LLM
+        def qa_invoke(inputs: dict) -> str:
+            docs = inputs["context"]
+            context_str = "\n\n".join(doc.page_content for doc in docs)
+            return (
+                QA_PROMPT
+                | self._llm
+                | StrOutputParser()
+            ).invoke({
+                "input": inputs["input"],
+                "chat_history": inputs.get("chat_history", []),
+                "context": context_str,
+            })
+
+        # Full chain
+        def full_chain(inputs: dict) -> dict:
+            docs = history_aware_retrieve(inputs)
+            answer = qa_invoke({**inputs, "context": docs})
+            return {"answer": answer, "context": docs}
+
+        self.chain = RunnableLambda(full_chain)
         self._initialized = True
         return True
 
     def ask(self, question: str, role_context: str = "") -> dict:
-        """
-        Ask a question and get an answer with sources.
-
-        Returns dict with keys: answer, raw_answer, sources
-        """
+        """Ask a question and get an answer with sources."""
         if not self._initialized:
             self.initialize()
 
@@ -145,7 +169,7 @@ class GitLabChatbot:
 
         answer = result.get("answer", "Sorry, I couldn't generate a response.")
 
-        # Update sliding window history (keep last 5 exchanges = 10 messages)
+        # Sliding window history (last 5 exchanges)
         self.chat_history.append(HumanMessage(content=effective_question))
         self.chat_history.append(AIMessage(content=answer))
         if len(self.chat_history) > 10:
