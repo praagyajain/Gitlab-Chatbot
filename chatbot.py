@@ -71,6 +71,7 @@ class GitLabChatbot:
 
     def __init__(self):
         self.chain = None
+        self._llm = None  # stored for follow-up generation
         self.chat_history = []  # list of HumanMessage / AIMessage
         self._initialized = False
 
@@ -112,6 +113,7 @@ class GitLabChatbot:
             google_api_key=api_key,
             temperature=LLM_TEMPERATURE,
         )
+        self._llm = llm  # store for external access (follow-up generation)
 
         # Build chain: history-aware retriever → stuff documents → answer
         history_aware_retriever = create_history_aware_retriever(

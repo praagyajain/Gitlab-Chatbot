@@ -323,9 +323,9 @@ CLUSTER_NAMES = list(CLUSTER_QUESTIONS.keys())
 
 # ── Helper: get LLM from chatbot ──────────────────────────────────────────────
 def _get_llm():
-    """Safely retrieve the LLM instance from the chatbot chain."""
+    """Safely retrieve the LLM instance from the chatbot."""
     try:
-        return st.session_state.chatbot.chain.combine_docs_chain.llm_chain.llm
+        return st.session_state.chatbot._llm
     except AttributeError:
         return None
 
