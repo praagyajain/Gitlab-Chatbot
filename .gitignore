@@ -7,7 +7,6 @@ vectorstore/
 .venv/
 venv/
 env/
-sensitive.py
 
 #logs
 *.log
