@@ -1,6 +1,5 @@
 # Data & vectorstore (regenerable)
 data/
-vectorstore/
 
 # Environment
 .env
